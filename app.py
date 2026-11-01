@@ -7,9 +7,14 @@ import streamlit.components.v1 as components
 # ตั้งค่าหน้าจอ App
 st.set_page_config(page_title="ระบบจัดการหอพักคุณแม่", page_icon="🏢", layout="centered")
 
-# ฟังก์ชันเชื่อมต่อ Neon PostgreSQL
 def get_db_connection():
-    conn = psycopg2.connect(st.secrets["DATABASE_URL"])
+    # รองรับทั้ง Streamlit Secrets (ตอนรันบนเครื่อง) และ Render Environment Variables
+    if "DATABASE_URL" in st.secrets:
+        db_url = st.secrets["DATABASE_URL"]
+    else:
+        db_url = os.environ.get("DATABASE_URL")
+        
+    conn = psycopg2.connect(db_url)
     return conn
 
 st.title("🏢 ระบบจัดการหอพัก (ฉบับจบในที่เดียว)")
