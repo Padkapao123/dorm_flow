@@ -1,6 +1,6 @@
 import html
 import os
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import psycopg2
@@ -36,6 +36,10 @@ BILL_COLS = [
 # ---------------------------------------------------------------------------
 # ฟังก์ชันช่วยเหลือทั่วไป
 # ---------------------------------------------------------------------------
+def as_date(value):
+    return value.date() if isinstance(value, datetime) else value
+
+
 def thai_period(d):
     """แปลงวันที่เป็น 'ตุลาคม 2569' (ปี พ.ศ.)"""
     return f"{THAI_MONTHS[d.month - 1]} {d.year + 543}"
@@ -57,7 +61,7 @@ def money(value):
 
 
 def current_meters_of(row):
-    """เลขมิเตอร์ปัจจุบันของบิลที่มีอยู่แล้ว: ใช้ *_meter_end ถ้ามีค่า ไม่งั้นใช้ *_meter (ข้อมูลเก่า)"""
+    """เลขมิเตอร์ปัจจุบันของบิล: ใช้ *_meter_end ถ้ามีค่า ไม่งั้นใช้ *_meter (ข้อมูลเก่า)"""
     elec = to_float(row.get("elec_meter_end"))
     water = to_float(row.get("water_meter_end"))
     if elec <= 0:
@@ -65,6 +69,11 @@ def current_meters_of(row):
     if water <= 0:
         water = to_float(row.get("water_meter"))
     return elec, water
+
+
+def bill_is_calculated(row):
+    """บิลที่คำนวณยอดแล้วจะมี total_charge มากกว่า 0"""
+    return to_float(row.get("total_charge")) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +144,12 @@ def ensure_tables():
     db_execute(
         """
         CREATE TABLE IF NOT EXISTS dorm_rates (
-            valid_from     DATE PRIMARY KEY,
+            rate_id        SERIAL PRIMARY KEY,
+            valid_from     DATE NOT NULL,
             elec_per_unit  NUMERIC(10,2) NOT NULL,
             water_per_unit NUMERIC(10,2) NOT NULL,
-            rent           NUMERIC(10,2) NOT NULL
+            rent           NUMERIC(10,2) NOT NULL,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
@@ -185,26 +196,72 @@ def ensure_tables():
 
 
 # ---------------------------------------------------------------------------
-# 2) ดึงเรทราคาปัจจุบันจากตาราง dorm_rates
+# 2) เรทราคาจากตาราง dorm_rates
 # ---------------------------------------------------------------------------
-def get_current_rates():
-    """คืน (rates, found) โดย rates ดึงจากแถวที่ valid_from ล่าสุด"""
+def get_all_rates():
+    """เรททั้งหมด เรียงจากเก่าไปใหม่"""
     rows = db_fetch(
         """
-        SELECT elec_per_unit, water_per_unit, rent
+        SELECT valid_from, elec_per_unit, water_per_unit, rent
         FROM dorm_rates
-        ORDER BY valid_from DESC
-        LIMIT 1
+        WHERE valid_from IS NOT NULL
+        ORDER BY valid_from ASC, rate_id ASC
         """
     )
-    if not rows:
-        return dict(DEFAULT_RATES), False
-    r = rows[0]
+    for r in rows:
+        r["valid_from"] = as_date(r["valid_from"])
+    return rows
+
+
+def pick_rates(all_rates, period):
+    """
+    เลือกเรทที่ใช้กับงวด period: แถวที่ valid_from ล่าสุดที่ไม่เกินงวดนั้น
+    ถ้างวดเก่ากว่าเรทชุดแรกสุด จะใช้เรทชุดแรกสุดแทน ถ้าไม่มีเรทเลยใช้ค่าเริ่มต้น
+    คืนค่า (rates, valid_from, is_fallback)
+    """
+    if not all_rates:
+        return dict(DEFAULT_RATES), None, True
+    applicable = [r for r in all_rates if r["valid_from"] <= period]
+    fallback = not applicable
+    row = applicable[-1] if applicable else all_rates[0]
     return {
-        "elec_per_unit": to_float(r["elec_per_unit"]),
-        "water_per_unit": to_float(r["water_per_unit"]),
-        "rent": to_float(r["rent"]),
-    }, True
+        "elec_per_unit": to_float(row["elec_per_unit"]),
+        "water_per_unit": to_float(row["water_per_unit"]),
+        "rent": to_float(row["rent"]),
+    }, row["valid_from"], fallback
+
+
+def upsert_rate(valid_from, elec_per_unit, water_per_unit, rent):
+    """ถ้ามีเรทของ valid_from นี้แล้วให้แก้ไข ถ้ายังไม่มีให้เพิ่มแถวใหม่ คืน 'updated' / 'inserted'"""
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE dorm_rates
+                    SET elec_per_unit = %s, water_per_unit = %s, rent = %s
+                    WHERE rate_id = (
+                        SELECT rate_id FROM dorm_rates
+                        WHERE valid_from = %s
+                        ORDER BY rate_id DESC
+                        LIMIT 1
+                    )
+                    """,
+                    (elec_per_unit, water_per_unit, rent, valid_from),
+                )
+                if cur.rowcount == 0:
+                    cur.execute(
+                        """
+                        INSERT INTO dorm_rates (valid_from, elec_per_unit, water_per_unit, rent)
+                        VALUES (%s, %s, %s, %s)
+                        """,
+                        (valid_from, elec_per_unit, water_per_unit, rent),
+                    )
+                    return "inserted"
+                return "updated"
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +317,8 @@ def get_all_bills(table):
     return db_fetch(f"SELECT * FROM {table} ORDER BY bill_date DESC")
 
 
-def save_bill(table, bill):
-    """บันทึกบิล ถ้า bill_id ซ้ำจะ UPDATE ทับข้อมูลเดิม (created_at คงเดิม)"""
-    db_execute(
-        f"""
+def build_upsert_sql(table):
+    return f"""
         INSERT INTO {table} (
             bill_id, room_id, bill_date,
             elec_meter, water_meter, note,
@@ -294,9 +349,79 @@ def save_bill(table, bill):
             elec_charge     = EXCLUDED.elec_charge,
             water_charge    = EXCLUDED.water_charge,
             total_charge    = EXCLUDED.total_charge
-        """,
-        bill,
-    )
+    """
+
+
+def save_bills(table, bills):
+    """บันทึกบิลหลายรายการในการเชื่อมต่อเดียว ถ้า bill_id ซ้ำจะ UPDATE ทับ (created_at คงเดิม)"""
+    sql = build_upsert_sql(table)
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for bill in bills:
+                    cur.execute(sql, bill)
+    finally:
+        conn.close()
+
+
+def save_bill(table, bill):
+    save_bills(table, [bill])
+
+
+# ---------------------------------------------------------------------------
+# คำนวณบิลจากแถวที่มีอยู่ (ใช้กับบิลย้อนหลังที่ยังไม่ได้คำนวณยอด)
+# ---------------------------------------------------------------------------
+def compute_bill(bill, prev_meters, rates):
+    """คำนวณหน่วยและยอดเงินของบิลที่มีเลขมิเตอร์แล้ว คืน dict พร้อมบันทึกลงฐานข้อมูลได้"""
+    cur_elec, cur_water = current_meters_of(bill)
+    prev_elec, prev_water = prev_meters
+    elec_units = max(0.0, cur_elec - prev_elec)
+    water_units = max(0.0, cur_water - prev_water)
+    elec_charge = elec_units * rates["elec_per_unit"]
+    water_charge = water_units * rates["water_per_unit"]
+    rent = rates["rent"]
+    parking = to_float(bill.get("parking_fee"))
+    return {
+        "bill_id": bill["bill_id"],
+        "room_id": int(bill["room_id"]),
+        "bill_date": bill["bill_date"],
+        "elec_meter": int(round(cur_elec)),
+        "water_meter": cur_water,
+        "note": bill.get("note"),
+        "elec_meter_end": cur_elec,
+        "water_meter_end": cur_water,
+        "parking_fee": parking,
+        "rent": rent,
+        "elec_unit_used": elec_units,
+        "water_unit_used": water_units,
+        "elec_charge": elec_charge,
+        "water_charge": water_charge,
+        "total_charge": rent + elec_charge + water_charge + parking,
+    }
+
+
+def plan_backfill(all_bills, all_rates):
+    """
+    หาบิลที่ยังไม่คำนวณยอด แล้วคำนวณจากเลขมิเตอร์ของบิลก่อนหน้าในห้องเดียวกัน
+    บิลแรกของแต่ละห้องไม่มีมิเตอร์ก่อนหน้า จึงข้ามไว้ (นับเป็น skipped)
+    """
+    by_room = {}
+    for b in all_bills:
+        by_room.setdefault(b["room_id"], []).append(b)
+    todo, skipped = [], 0
+    for rows in by_room.values():
+        rows.sort(key=lambda r: r["bill_date"])
+        prev = None
+        for r in rows:
+            if not bill_is_calculated(r):
+                if prev is None:
+                    skipped += 1
+                else:
+                    rates_p, _, _ = pick_rates(all_rates, as_date(r["bill_date"]))
+                    todo.append(compute_bill(r, current_meters_of(prev), rates_p))
+            prev = r
+    return todo, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +519,10 @@ if not get_database_url():
     st.error("ไม่พบ DATABASE_URL กรุณาตั้งค่าใน Environment Variable หรือ st.secrets แล้วรีสตาร์ทแอป")
     st.stop()
 
+# ข้อความแจ้งผลหลังบันทึก (ตั้งไว้ก่อน st.rerun แล้วแสดงตรงนี้)
+if "flash" in st.session_state:
+    st.success(st.session_state.pop("flash"))
+
 # ---- แถบด้านข้าง: สลับโหมดทดสอบ / ตารางจริง ----
 st.sidebar.header("⚙️ ตั้งค่า")
 use_mock = st.sidebar.checkbox(
@@ -408,36 +537,32 @@ try:
     if use_mock and st.sidebar.button(f"♻️ รีเซ็ต {TABLE_MOCK} ให้เหมือนตารางจริง"):
         reset_mock()
         st.sidebar.success("รีเซ็ตข้อมูลทดสอบแล้ว")
-    rates, rates_found = get_current_rates()
+    all_rates = get_all_rates()
 except Exception as exc:
     st.error(f"เชื่อมต่อฐานข้อมูลไม่สำเร็จ: {exc}")
     st.stop()
 
 if use_mock:
     st.warning(
-        f"🧪 โหมดทดสอบ: ระบบอ่านและบันทึกที่ตาราง {TABLE_MOCK} เท่านั้น "
-        f"ไม่กระทบข้อมูลจริง (ติ๊กออกที่เมนูด้านซ้ายเมื่อต้องการใช้งานจริง)"
+        f"🧪 โหมดทดสอบ: ระบบอ่านและบันทึกบิลที่ตาราง {TABLE_MOCK} เท่านั้น "
+        f"ไม่กระทบบิลจริง (ติ๊กออกที่เมนูด้านซ้ายเมื่อต้องการใช้งานจริง) "
+        f"หมายเหตุ: ตารางเรท dorm_rates ใช้ร่วมกันทั้งสองโหมด"
     )
 
-if not rates_found:
+if not all_rates:
     st.warning(
         "ยังไม่มีข้อมูลในตาราง dorm_rates ระบบจึงใช้ค่าเริ่มต้นชั่วคราว "
         f"(ไฟ {DEFAULT_RATES['elec_per_unit']:.2f} / น้ำ {DEFAULT_RATES['water_per_unit']:.2f} / "
-        f"ค่าเช่า {DEFAULT_RATES['rent']:,.0f} บาท)"
+        f"ค่าเช่า {DEFAULT_RATES['rent']:,.0f} บาท) ไปตั้งเรทได้ที่แท็บ 'ปรับเรท'"
     )
 
-tab_bill, tab_history = st.tabs(["📝 บันทึกบิล", "📚 ประวัติบิลทั้งหมด"])
+tab_bill, tab_history, tab_rates = st.tabs(["📝 บันทึกบิล", "📚 ประวัติบิลทั้งหมด", "💰 ปรับเรท"])
 
 # ===========================================================================
 # Tab 1: ฟอร์มบันทึกบิล + ใบแจ้งหนี้
 # ===========================================================================
 with tab_bill:
     st.subheader("บันทึกและคำนวณบิล")
-    st.caption(
-        f"เรทปัจจุบัน: ค่าไฟ {rates['elec_per_unit']:,.2f} บาท/หน่วย  |  "
-        f"ค่าน้ำ {rates['water_per_unit']:,.2f} บาท/หน่วย  |  "
-        f"ค่าเช่า {rates['rent']:,.2f} บาท"
-    )
 
     c1, c2 = st.columns(2)
     with c1:
@@ -447,6 +572,17 @@ with tab_bill:
 
     period = picked_date.replace(day=1)
     bill_id = f"{period:%Y%m}-{room_id}"  # รูปแบบเดียวกับข้อมูลเดิม เช่น 202510-1
+
+    # เรทที่ใช้กับงวดนี้ (งวดย้อนหลังจะใช้เรทที่มีผลในช่วงนั้น)
+    rates, rates_from, rates_fallback = pick_rates(all_rates, period)
+    rate_note = (
+        f"มีผลตั้งแต่ {thai_period(rates_from)}" if rates_from and not rates_fallback
+        else ("ใช้เรทชุดแรกสุดในตาราง" if rates_from else "ค่าเริ่มต้นชั่วคราว")
+    )
+    st.caption(
+        f"เรทที่ใช้กับงวดนี้ ({rate_note}): ค่าไฟ {rates['elec_per_unit']:,.2f} บาท/หน่วย  |  "
+        f"ค่าน้ำ {rates['water_per_unit']:,.2f} บาท/หน่วย  |  ค่าเช่า {rates['rent']:,.2f} บาท"
+    )
 
     try:
         prev_row = get_prev_row(TABLE, room_id, period)
@@ -501,12 +637,6 @@ with tab_bill:
 
     key_prefix = f"{TABLE}_{bill_id}"
     with st.form("bill_form"):
-        rent_default = to_float(existing["rent"]) if existing else rates["rent"]
-        rent = st.number_input(
-            "ค่าเช่าห้องพัก (บาท)", min_value=0.0, value=float(rent_default),
-            step=100.0, format="%.2f", key=f"rent_{key_prefix}",
-        )
-
         pc1, pc2 = st.columns(2)
         with pc1:
             prev_elec_in = st.number_input(
@@ -535,6 +665,13 @@ with tab_bill:
         note = st.text_area(
             "หมายเหตุ", value=(existing["note"] or "") if existing else "", key=f"note_{key_prefix}"
         )
+        with st.expander("ค่าเช่าห้อง (ใช้ตามเรท ปกติไม่ต้องแก้ แก้เฉพาะบิลนี้เท่านั้น)"):
+            rent_default = to_float(existing["rent"]) if (existing and bill_is_calculated(existing)) else rates["rent"]
+            rent = st.number_input(
+                "ค่าเช่าห้องพัก (บาท)", min_value=0.0, value=float(rent_default),
+                step=100.0, format="%.2f", key=f"rent_{key_prefix}_{rates['rent']}",
+            )
+            st.caption("ถ้าต้องการเปลี่ยนค่าเช่าถาวร ให้ไปที่แท็บ 'ปรับเรท'")
         submitted = st.form_submit_button("💾 คำนวณและบันทึก", use_container_width=True)
 
     if submitted:
@@ -586,7 +723,7 @@ with tab_bill:
             st.error(f"บันทึกไม่สำเร็จ: {exc}")
 
     # -----------------------------------------------------------------------
-    # ส่วนใบแจ้งหนี้ (Receipt)
+    # ส่วนใบแจ้งหนี้ (Receipt) เลือกงวดย้อนหลังได้
     # -----------------------------------------------------------------------
     st.divider()
     st.subheader("🧾 ใบแจ้งหนี้ (แคปหน้าจอส่งไลน์)")
@@ -613,11 +750,44 @@ with tab_bill:
             st.session_state.pop("rc_bill", None)
         with r2:
             rc_bill_id = st.selectbox(
-                "เลือกงวดบิล", options,
+                "เลือกงวดบิล (ย้อนหลังได้)", options,
                 format_func=lambda b: thai_period(bills_by_id[b]["bill_date"]),
                 key="rc_bill",
             )
-        components.html(build_receipt_html(bills_by_id[rc_bill_id]), height=560, scrolling=True)
+        rc_bill = bills_by_id[rc_bill_id]
+
+        if bill_is_calculated(rc_bill):
+            receipt_bill = rc_bill
+        else:
+            # บิลย้อนหลังที่ยังไม่มียอดในฐานข้อมูล: คำนวณสดจากเลขมิเตอร์และเรทของงวดนั้น
+            rc_prev = get_prev_row(TABLE, rc_room, rc_bill["bill_date"])
+            rc_rates, rc_rates_from, _ = pick_rates(all_rates, as_date(rc_bill["bill_date"]))
+            rc_prev_meters = (
+                (to_float(rc_prev["prev_elec"]), to_float(rc_prev["prev_water"])) if rc_prev else (0.0, 0.0)
+            )
+            receipt_bill = compute_bill(rc_bill, rc_prev_meters, rc_rates)
+
+            st.info(
+                "บิลงวดนี้ยังไม่ได้คำนวณยอดในฐานข้อมูล ระบบคำนวณให้จากเลขมิเตอร์และเรทของงวดนั้นแล้ว "
+                "(แคปส่งไลน์ได้เลย)"
+            )
+            if not rc_prev:
+                st.warning("ยังไม่มีบิลก่อนหน้าของห้องนี้ ระบบจึงคิดหน่วยที่ใช้จาก 0 กรุณาตรวจสอบก่อนส่ง")
+            cur_e, cur_w = current_meters_of(rc_bill)
+            if cur_e < rc_prev_meters[0] or cur_w < rc_prev_meters[1]:
+                st.warning("เลขมิเตอร์งวดนี้น้อยกว่างวดก่อน ระบบคิดหน่วยที่ใช้เป็น 0 กรุณาตรวจสอบ")
+            if st.button("💾 บันทึกยอดนี้ลงฐานข้อมูล", key=f"save_calc_{TABLE}_{rc_bill_id}"):
+                try:
+                    save_bill(TABLE, receipt_bill)
+                    st.session_state["flash"] = (
+                        f"บันทึกยอดบิล {rc_bill_id} ลงตาราง {TABLE} แล้ว "
+                        f"ยอดรวม {receipt_bill['total_charge']:,.2f} บาท"
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"บันทึกไม่สำเร็จ: {exc}")
+
+        components.html(build_receipt_html(receipt_bill), height=560, scrolling=True)
 
 # ===========================================================================
 # Tab 2: ประวัติบิลทั้งหมด
@@ -669,3 +839,88 @@ with tab_history:
         )
         st.dataframe(show, use_container_width=True, hide_index=True)
         st.caption(f"ทั้งหมด {len(show)} รายการ")
+
+        # ---- เครื่องมือคำนวณบิลย้อนหลังทั้งหมดที่ยังไม่คำนวณ ----
+        todo, skipped = plan_backfill(all_bills, all_rates)
+        with st.expander("🛠️ คำนวณบิลย้อนหลังที่ยังไม่คำนวณ (ทุกห้อง)"):
+            st.write(
+                f"พบ **{len(todo)}** บิลที่คำนวณได้ "
+                f"(ข้ามบิลแรกของแต่ละห้อง {skipped} บิล เพราะไม่มีเลขมิเตอร์ก่อนหน้าให้เทียบ)"
+            )
+            st.caption(
+                "คำนวณหน่วยจากเลขมิเตอร์ของบิลก่อนหน้า และใช้เรทที่มีผลในงวดนั้น "
+                "บิลที่มียอดอยู่แล้วจะไม่ถูกแตะต้อง"
+            )
+            confirm = st.checkbox(f"ยืนยันบันทึกลงตาราง {TABLE}", key="bf_confirm")
+            if st.button("คำนวณและบันทึกบิลย้อนหลัง", disabled=(not confirm or not todo), key="bf_run"):
+                try:
+                    save_bills(TABLE, todo)
+                    st.session_state["flash"] = f"คำนวณและบันทึกบิลย้อนหลัง {len(todo)} บิล ลงตาราง {TABLE} เรียบร้อย"
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"บันทึกไม่สำเร็จ: {exc}")
+
+# ===========================================================================
+# Tab 3: ปรับเรท (ค่าเช่า / ค่าน้ำ / ค่าไฟ) -> ตาราง dorm_rates
+# ===========================================================================
+with tab_rates:
+    st.subheader("ปรับเรทค่าห้อง ค่าน้ำ ค่าไฟ")
+    this_month = date.today().replace(day=1)
+    cur_rates, cur_from, _ = pick_rates(all_rates, this_month)
+    st.info(
+        f"เรทที่ใช้อยู่ตอนนี้: ค่าเช่า **{cur_rates['rent']:,.2f}** บาท  |  "
+        f"ค่าน้ำ **{cur_rates['water_per_unit']:,.2f}** บาท/หน่วย  |  "
+        f"ค่าไฟ **{cur_rates['elec_per_unit']:,.2f}** บาท/หน่วย"
+        + (f"  (มีผลตั้งแต่ {thai_period(cur_from)})" if cur_from else "")
+    )
+    st.caption(
+        "เมื่อบันทึก ระบบจะเพิ่มเรทชุดใหม่ลงตาราง dorm_rates (ถ้ามีเรทของเดือนเดียวกันอยู่แล้วจะแก้ไขทับ) "
+        "บิลของงวดที่เลือกเป็นต้นไปจะใช้เรทใหม่ ส่วนบิลงวดก่อนหน้ายังใช้เรทเดิม"
+    )
+
+    with st.form("rate_form"):
+        valid_from_in = st.date_input(
+            "เริ่มใช้ตั้งแต่งวด (ระบบใช้วันที่ 1 ของเดือนที่เลือก)", value=this_month, key="rate_valid_from"
+        )
+        new_rent = st.number_input(
+            "ค่าเช่าห้อง (บาท)", min_value=0.0, value=float(cur_rates["rent"]),
+            step=100.0, format="%.2f", key=f"nr_rent_{cur_rates['rent']}",
+        )
+        new_water = st.number_input(
+            "ค่าน้ำ (บาท/หน่วย)", min_value=0.0, value=float(cur_rates["water_per_unit"]),
+            step=0.5, format="%.2f", key=f"nr_water_{cur_rates['water_per_unit']}",
+        )
+        new_elec = st.number_input(
+            "ค่าไฟ (บาท/หน่วย)", min_value=0.0, value=float(cur_rates["elec_per_unit"]),
+            step=0.5, format="%.2f", key=f"nr_elec_{cur_rates['elec_per_unit']}",
+        )
+        rate_submitted = st.form_submit_button("💾 บันทึกเรท", use_container_width=True)
+
+    if rate_submitted:
+        try:
+            vf = valid_from_in.replace(day=1)
+            result = upsert_rate(vf, float(new_elec), float(new_water), float(new_rent))
+            verb = "เพิ่มเรทใหม่" if result == "inserted" else "แก้ไขเรทเดิม"
+            st.session_state["flash"] = f"{verb}ใน dorm_rates เรียบร้อย มีผลตั้งแต่งวด {thai_period(vf)}"
+            st.rerun()
+        except Exception as exc:
+            st.error(f"บันทึกเรทไม่สำเร็จ: {exc}")
+
+    st.divider()
+    st.markdown("**ประวัติเรททั้งหมด**")
+    if all_rates:
+        rate_df = pd.DataFrame(
+            [
+                {
+                    "มีผลตั้งแต่งวด": thai_period(r["valid_from"]),
+                    "valid_from": r["valid_from"],
+                    "ค่าเช่า": to_float(r["rent"]),
+                    "ค่าน้ำ/หน่วย": to_float(r["water_per_unit"]),
+                    "ค่าไฟ/หน่วย": to_float(r["elec_per_unit"]),
+                }
+                for r in reversed(all_rates)
+            ]
+        )
+        st.dataframe(rate_df, use_container_width=True, hide_index=True)
+    else:
+        st.write("ยังไม่มีข้อมูลเรทในตาราง dorm_rates")
