@@ -480,7 +480,7 @@ def build_receipt_html(bill):
     body = f"""
     <div class="card">
       <div class="head">
-        <div class="title">ใบแจ้งค่าเช่าหอพัก</div>
+        <div class="title">ใบแจ้งค่าเช่าหอพักนัยนันท์</div>
         <div class="period">ประจำเดือน {period_text}</div>
       </div>
       <div class="meta">
