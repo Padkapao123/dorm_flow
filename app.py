@@ -431,30 +431,32 @@ RECEIPT_CSS = """
 <link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 8px; background: transparent;
+  html, body { margin: 0; padding: 0; overflow: hidden; }
+  body { padding: 4px; background: transparent; line-height: 1.35;
+         -webkit-text-size-adjust: 100%;
          font-family: 'Sarabun', 'Noto Sans Thai', 'Tahoma', sans-serif; }
-  .card { max-width: 440px; margin: 0 auto; background: #ffffff;
-          border-radius: 18px; overflow: hidden;
+  .card { width: 100%; max-width: 400px; margin: 0 auto; background: #ffffff;
+          border-radius: 16px; overflow: hidden;
           border: 2px solid #0f4c5c; color: #1b2a30; }
-  .head { background: #0f4c5c; color: #ffffff; padding: 22px 24px 18px; text-align: center; }
-  .head .title { font-size: 26px; font-weight: 700; letter-spacing: 0.5px; }
-  .head .period { font-size: 24px; font-weight: 600; margin-top: 6px; color: #ffd166; }
-  .meta { display: flex; justify-content: space-between; gap: 10px;
-          padding: 16px 24px; background: #eaf3f5; font-size: 20px; }
+  .head { background: #0f4c5c; color: #ffffff; padding: 12px 14px 10px; text-align: center; }
+  .head .title { font-size: 20px; font-weight: 700; }
+  .head .period { font-size: 20px; font-weight: 600; margin-top: 2px; color: #ffd166; }
+  .meta { display: flex; justify-content: space-between; align-items: center; gap: 8px;
+          padding: 8px 14px; background: #eaf3f5; font-size: 17px; }
   .meta b { font-weight: 700; }
-  .meta .code { font-size: 17px; color: #4a5f66; align-self: center; }
-  .rows { padding: 8px 24px 4px; }
+  .meta .code { font-size: 13px; color: #4a5f66; }
+  .rows { padding: 2px 14px 0; }
   .row { display: flex; justify-content: space-between; align-items: baseline;
-         gap: 12px; padding: 14px 0; border-bottom: 2px dashed #cfdde1;
-         font-size: 22px; }
+         gap: 8px; padding: 9px 0; border-bottom: 1.5px dashed #cfdde1;
+         font-size: 18px; }
   .row .label { flex: 1; }
   .row .amt { font-weight: 700; white-space: nowrap; }
-  .row .unit { font-size: 18px; color: #5a6f76; }
-  .total { margin: 14px 18px 22px; padding: 18px 12px; text-align: center;
-           background: #fff1f0; border: 2px solid #d62828; border-radius: 14px; }
-  .total .t-label { font-size: 22px; font-weight: 600; color: #7a1c1c; }
-  .total .t-amt { font-size: 52px; font-weight: 700; color: #d62828; line-height: 1.15; }
-  .total .t-unit { font-size: 22px; font-weight: 600; color: #7a1c1c; }
+  .row .unit { font-size: 14px; color: #5a6f76; }
+  .total { margin: 10px 12px 12px; padding: 10px 8px; text-align: center;
+           background: #fff1f0; border: 2px solid #d62828; border-radius: 12px; }
+  .total .t-label { font-size: 17px; font-weight: 600; color: #7a1c1c; }
+  .total .t-amt { font-size: 40px; font-weight: 700; color: #d62828; line-height: 1.15; }
+  .total .t-unit { font-size: 17px; font-weight: 600; color: #7a1c1c; }
 </style>
 """
 
@@ -508,6 +510,30 @@ def build_receipt_html(bill):
     </div>
     """
     return RECEIPT_CSS + body
+
+
+def receipt_height(bill):
+    """ความสูงของกรอบใบแจ้งหนี้ (พอดีกับเนื้อหา ไม่ต้องเลื่อนในกรอบ) แถวค่าที่จอดรถเพิ่มความสูง"""
+    return 430 + (44 if to_float(bill["parking_fee"]) > 0 else 0)
+
+
+def month_picker(key, default_date):
+    """เลือกเดือนและปี (พ.ศ.) เป็นภาษาไทย คืนค่าเป็นวันที่ 1 ของเดือนนั้น"""
+    today = date.today()
+    years = list(range(today.year - 4, today.year + 2))
+    year_default = default_date.year if default_date.year in years else today.year
+    c_month, c_year = st.columns(2)
+    with c_month:
+        month = st.selectbox(
+            "เดือน (งวดบิล)", list(range(1, 13)), index=default_date.month - 1,
+            format_func=lambda m: THAI_MONTHS[m - 1], key=f"{key}_month",
+        )
+    with c_year:
+        year = st.selectbox(
+            "ปี (พ.ศ.)", years, index=years.index(year_default),
+            format_func=lambda y: str(y + 543), key=f"{key}_year",
+        )
+    return date(year, month, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -564,13 +590,8 @@ tab_bill, tab_history, tab_rates = st.tabs(["📝 บันทึกบิล", 
 with tab_bill:
     st.subheader("บันทึกและคำนวณบิล")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        room_id = st.selectbox("เลือกห้องพัก", ROOMS, format_func=lambda r: f"ห้อง {r}", key="form_room")
-    with c2:
-        picked_date = st.date_input("วันที่ / งวดประจำเดือน", value=date.today(), key="form_date")
-
-    period = picked_date.replace(day=1)
+    room_id = st.selectbox("เลือกห้องพัก", ROOMS, format_func=lambda r: f"ห้อง {r}", key="form_room")
+    period = month_picker("form_period", date.today())  # เก็บใน database เป็นวันที่ 1 ของเดือน
     bill_id = f"{period:%Y%m}-{room_id}"  # รูปแบบเดียวกับข้อมูลเดิม เช่น 202510-1
 
     # เรทที่ใช้กับงวดนี้ (งวดย้อนหลังจะใช้เรทที่มีผลในช่วงนั้น)
@@ -787,7 +808,7 @@ with tab_bill:
                 except Exception as exc:
                     st.error(f"บันทึกไม่สำเร็จ: {exc}")
 
-        components.html(build_receipt_html(receipt_bill), height=560, scrolling=True)
+        components.html(build_receipt_html(receipt_bill), height=receipt_height(receipt_bill), scrolling=False)
 
 # ===========================================================================
 # Tab 2: ประวัติบิลทั้งหมด
@@ -879,9 +900,8 @@ with tab_rates:
     )
 
     with st.form("rate_form"):
-        valid_from_in = st.date_input(
-            "เริ่มใช้ตั้งแต่งวด (ระบบใช้วันที่ 1 ของเดือนที่เลือก)", value=this_month, key="rate_valid_from"
-        )
+        st.markdown("**เริ่มใช้ตั้งแต่งวด**")
+        valid_from_in = month_picker("rate_from", this_month)
         new_rent = st.number_input(
             "ค่าเช่าห้อง (บาท)", min_value=0.0, value=float(cur_rates["rent"]),
             step=100.0, format="%.2f", key=f"nr_rent_{cur_rates['rent']}",
